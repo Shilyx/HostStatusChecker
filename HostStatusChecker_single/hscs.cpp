@@ -21,7 +21,9 @@ static enum
 static enum
 {
     MI_ABOUT = 11,
+    MI_COPY_IP,
     MI_USEINFO,
+    MI_RESTART,
     MI_QUIT,
 };
 
@@ -134,6 +136,79 @@ BOOL SetSockKeepAlive(
         );
 }
 
+static void RunSelf()
+{
+    TCHAR szImagePath[MAX_PATH];
+    TCHAR szCmdLine[MAX_PATH + 4096];
+    STARTUPINFO si = {sizeof(si)};
+    PROCESS_INFORMATION pi;
+
+    GetModuleFileName(GetModuleHandle(NULL), szImagePath, RTL_NUMBER_OF(szImagePath));
+    wnsprintf(szCmdLine, RTL_NUMBER_OF(szCmdLine), TEXT("\"%s\" %hs %u"), szImagePath, g_szDomainName, g_usPort);
+
+    if (CreateProcess(NULL, szCmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
+    {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+}
+
+BOOL SetClipboardText(HWND hwnd, LPCTSTR lpText)
+{
+    if (lpText == NULL)
+    {
+        lpText = TEXT("");
+    }
+
+    BOOL bResult = FALSE;
+    int nLength = (lstrlen(lpText) + 1) * sizeof(TCHAR);
+    HGLOBAL hGlobal = GlobalAlloc(GMEM_MOVEABLE, nLength);
+
+    if (hGlobal != NULL)
+    {
+        LPTSTR lpBuffer = (LPTSTR)GlobalLock(hGlobal);
+
+        if (lpBuffer != NULL)
+        {
+            lstrcpyn(lpBuffer, lpText, nLength);
+        }
+        else
+        {
+            GlobalFree(hGlobal);
+            hGlobal = NULL;
+        }
+    }
+
+    if (hGlobal == NULL)
+    {
+        return bResult;
+    }
+
+    if (OpenClipboard(hwnd))
+    {
+        EmptyClipboard();
+#ifdef UNICODE
+        bResult = SetClipboardData(CF_UNICODETEXT, hGlobal) != NULL;
+#else
+        bResult = SetClipboardData(CF_TEXT, hGlobal) != NULL;
+#endif
+        CloseClipboard();
+    }
+
+    GlobalFree(hGlobal);
+
+    return bResult;
+}
+
+BOOL CopyIpAddressToClipboard(HWND hWnd)
+{
+    TCHAR szIpAddress[128] = TEXT("");
+
+    wnsprintf(szIpAddress, RTL_NUMBER_OF(szIpAddress), TEXT("%hs"), inet_ntoa(*(in_addr *)&g_dwAddress));
+
+    return SetClipboardText(hWnd, szIpAddress);
+}
+
 static LRESULT __stdcall NotifyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     static NOTIFYICONDATA nid = {sizeof(nid)};
@@ -172,8 +247,9 @@ static LRESULT __stdcall NotifyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
     {
         BOOL bActive = (BOOL)wParam;
         BOOL bShowInfoThisTime = (BOOL)lParam;
+        UINT uOldFlags = nid.uFlags;
 
-        nid.uFlags = NIF_ICON | NIF_TIP;
+        nid.uFlags |= (NIF_ICON | NIF_TIP);
 
         wnsprintf(
             nid.szTip,
@@ -212,6 +288,7 @@ static LRESULT __stdcall NotifyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
         }
 
         Shell_NotifyIcon(NIM_MODIFY, &nid);
+        nid.uFlags = uOldFlags;
     }
     else if (uMsg == WM_CLOSE)
     {
@@ -236,7 +313,9 @@ static LRESULT __stdcall NotifyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
 
             AppendMenu(hMenu, MF_STRING, MI_ABOUT, TEXT("关于(&A)..."));
             AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+            AppendMenu(hMenu, MF_STRING, MI_COPY_IP, TEXT("复制ip地址(&C)"));
             AppendMenu(hMenu, MF_STRING, MI_USEINFO, TEXT("启用气泡通知(&B)"));
+            AppendMenu(hMenu, MF_STRING, MI_RESTART, TEXT("重新启动(&R)"));
             AppendMenu(hMenu, MF_STRING, MI_QUIT, TEXT("退出(&Q)"));
 
             if (bShowInfo)
@@ -254,9 +333,19 @@ static LRESULT __stdcall NotifyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
                 MessageBox(hWnd, TEXT("HostStatusChecker_single application"), TEXT("信息"), MB_SYSTEMMODAL | MB_ICONINFORMATION);
                 break;
 
+            case MI_COPY_IP:
+                if (!CopyIpAddressToClipboard(hWnd))
+                {
+                    MessageBox(hWnd, TEXT("复制信息到剪贴板出错"), NULL, MB_SYSTEMMODAL | MB_ICONERROR);
+                }
+                break;
+
             case MI_USEINFO:
                 bShowInfo = !bShowInfo;
                 break;
+
+            case MI_RESTART:
+                RunSelf();
 
             case MI_QUIT:
                 PostMessage(hWnd, WM_CLOSE, 0, 0);
@@ -277,8 +366,13 @@ static LRESULT __stdcall NotifyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
     return DefWindowProc(hWnd, uMsg, wParam, lParam);
 }
 
-BOOL GetHostInformation()
+BOOL GetHostInformation(BOOL *pbResolveError = NULL)
 {
+    if (pbResolveError != NULL)
+    {
+        *pbResolveError = FALSE;
+    }
+
     BOOL bSuccess = FALSE;
     int argc = 0;
     LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -310,7 +404,10 @@ BOOL GetHostInformation()
 
                 if (pHostEnt == NULL)
                 {
-                    MessageBoxFormat(NULL, NULL, MB_SYSTEMMODAL | MB_ICONERROR, TEXT("“%ls”无法正确解析"), argv[1]);
+                    if (pbResolveError != NULL)
+                    {
+                        *pbResolveError = TRUE;
+                    }
                 }
                 else
                 {
@@ -417,9 +514,21 @@ int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPTSTR lpCm
         return 0;
     }
 
-    if (!GetHostInformation())
+    while (TRUE)
     {
-        return 0;
+        BOOL bResolveError = FALSE;
+
+        if (GetHostInformation(&bResolveError))
+        {
+            break;
+        }
+        else
+        {
+            if (!bResolveError || IDRETRY != MessageBoxFormat(NULL, NULL, MB_SYSTEMMODAL | MB_ICONERROR | MB_RETRYCANCEL, TEXT("无法正确解析命令行中的域名（“%s”）"), lpCmdLine))
+            {
+                return 0;
+            }
+        }
     }
 
     WNDCLASSEX wcex = {sizeof(wcex)};
